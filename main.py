@@ -242,6 +242,25 @@ def forecast_case(case):
     return {"hours": rows}
 
 
+def safe_forecast(case):
+    """Forecast one case; on any unexpected input shape, fall back to
+    persistence rows rather than crashing the whole run (a crash would
+    invalidate every case in the run, a fallback only weakens one)."""
+    try:
+        return forecast_case(case)
+    except Exception:
+        try:
+            hour1 = case["known"][0]["viewers"]
+        except Exception:
+            hour1 = 1
+        mini = {"known": [{"viewers": hour1}]}
+        hours = sorted(fh["hour"] for fh in case.get("forecast") or []) \
+            or list(range(2, 25))
+        rows = [{"hour": h, "q": clean_quantiles(fallback_log_quantiles(mini, h))}
+                for h in hours]
+        return {"hours": rows}
+
+
 def main():
     in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
@@ -251,7 +270,7 @@ def main():
             continue
         with open(os.path.join(in_dir, name), encoding="utf-8") as fh:
             case = json.load(fh)
-        result = forecast_case(case)
+        result = safe_forecast(case)
         out_path = os.path.join(out_dir, name[:-3] + ".out")
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, separators=(",", ":"))
