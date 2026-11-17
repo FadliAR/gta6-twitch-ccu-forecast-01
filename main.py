@@ -1,36 +1,35 @@
 #!/usr/bin/env python3
-"""Forecast launch-day Twitch viewers hour by hour (make.fun program/v1).
+"""Forecast a game's launch-day Twitch viewers for hours 2-24.
 
-Method (from scratch, stdlib only, no network, deterministic):
-  * For every comparable launch, align its hourly series on its own release
-    day (00:00 UTC) and measure the log-ratio curve r_h = ln(v_h / a),
-    where a is a blended anchor: exp(0.75 * ln(v_1) + 0.25 * pre), and
-    pre is the mean log viewers in the 6 hours before release day.
-    Blending the noisy single-hour print with the pre-launch level
-    shrinks the well-documented size effect (big hour-1 prints grow
-    less in log terms over the day).
-  * The target's own anchor is built the same way from its hour-1 print
-    and its pre-launch history (hourly averages, or minute reads
-    aggregated to hours when that is all there is).
-  * Per forecast hour, take the weighted distribution of r_h across
-    comparables. Weights favour clean multi-platform AAA launches
-    (tier), and, when the target unlocks on a rolling midnight, favour
-    rolling-midnight comparables 3x over simultaneous-global ones.
-    The target's own category history (Grand Theft Auto VI itself) is
-    never a comparable: it is not a launch.
-  * Quantiles are the average of the empirical weighted quantile and a
-    normal-in-log quantile (weighted median +/- z * IQR/1.349), with the
-    distance from the median scaled by 0.70. The 0.70 spread was chosen
-    on comparable hold-outs: it lands 90% coverage near 0.92 while
-    beating the persistence baseline clearly (mean hold-out pinball
-    ~0.29 vs ~0.41 baseline on rolling AAA launches).
-  * Fallback: if no comparable is usable, fall back to the persistence
-    baseline shape q = p * exp(z * 0.15 * sqrt(h - 1)).
+The forecast is a set of five quantiles per hour, built by transferring
+launch curves from comparable game launches to the target game.
 
-Input:  $MAKEFUN_INPUT_DIR (else /input/), one JSON case per *.in file.
-Output: $MAKEFUN_OUTPUT_DIR (else /output/), one <id>.out per case:
-        {"hours": [{"hour": h, "q": [q05, q25, q50, q75, q95]}, ...]}
-        for hours 2..24, values finite, > 0, <= 1e9, non-decreasing.
+Method, in outline (everything is in log space):
+
+* Every launch, the target included, is summarised by a blended anchor:
+  mostly its hour-1 viewer print, partly the mean log viewers of the
+  six hours before launch.  Working with ratios to that anchor removes
+  the huge scale differences between launches.
+* A comparable contributes, for each launch hour, the log ratio between
+  its viewers that hour and its own anchor, weighted by how trustworthy
+  its launch pattern is (clean comparable, early-access contaminated,
+  or weak) and boosted when its unlock style matches a rolling-midnight
+  target.
+* The pooled log ratios are conditioned on launch size.  Measured on
+  the pool, small launches multiply many-fold during the day while
+  huge launches are already near their full audience at hour 1, so a
+  single pooled curve over-forecasts big launches late in the day and
+  under-forecasts small ones.  A per-hour weighted regression of the
+  log ratio on the log anchor (heavily shrunk, then clipped) captures
+  that tilt; the distribution for an hour is built from the regression
+  residuals and re-centred on launches of the target's size.
+* Each hour's quantiles blend the empirical weighted distribution of
+  the residuals with a normal approximation whose sigma also comes
+  from the residuals, and deviations from the median are shrunk by a
+  spread factor before the size shift is applied.
+
+Only the Python standard library is used, and the program is a pure
+function of its input files, so repeated runs are byte-identical.
 """
 
 import json
@@ -38,77 +37,39 @@ import math
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-ALPHA = 0.75          # weight on ln(hour-1 print) inside the anchor
-SPREAD = 0.70         # shrink factor for (quantile - median)
-BLEND = 0.5           # empirical vs normal-in-log quantile blend
-TIER_WEIGHT = {
-    "comparable": 1.0,
-    "early-access-contaminated": 0.4,
-    "weak": 0.25,
-}
-ROLL_BOOST = 3.0
-MIN_VALID_HOURS = 20
-PRE_WINDOW_HOURS = 6
-PRE_MIN_POINTS = 3
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z_OF_LEVEL = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-
-def parse_ts(text):
-    """Parse an ISO-8601 timestamp (trailing Z allowed) to aware datetime."""
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+ANCHOR_ALPHA = 0.75      # hour-1 print share of the blended anchor
+PRE_WINDOW = 6           # pre-launch hours feeding the anchor
+PRE_MIN = 3              # minimum pre-launch points for the blend
+MIN_DAY_HOURS = 20       # a comparable needs this many launch-day hours
+TIER_WEIGHT = {"comparable": 1.0, "early-access-contaminated": 0.4, "weak": 0.25}
+ROLL_BOOST = 3.0         # weight boost for rolling launches, rolling target
+REG_SHRINK = 0.40        # shrinkage applied to the raw size slope
+SLOPE_LO = -1.2          # clip bounds for the applied slope
+SLOPE_HI = 0.3
+SIGMA_FLOOR = 0.05       # smallest normal-approximation sigma
+BLEND = 0.5              # empirical vs normal mix for each quantile
+SPREAD = 0.65            # shrink of (quantile - median) in log space
+MAX_VIEWERS = 1_000_000_000.0
 
 
-def norm_ppf(p):
-    """Inverse standard normal CDF (Acklam's rational approximation)."""
-    a = [-3.969683028665376e+01, 2.209460984245205e+02,
-         -2.759285104469687e+02, 1.383577518672690e+02,
-         -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02,
-         -1.556989798598866e+02, 6.680131188771972e+01,
-         -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01,
-         -2.400758277161838e+00, -2.549732539343734e+00,
-         4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01,
-         2.445134137142996e+00, 3.754408661907416e+00]
-    plow = 0.02425
-    phigh = 1.0 - plow
-    if p < plow:
-        q = math.sqrt(-2.0 * math.log(p))
-        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    if p > phigh:
-        q = math.sqrt(-2.0 * math.log(1.0 - p))
-        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    q = p - 0.5
-    r = q * q
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
-        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+def parse_time(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def weighted_quantile(pairs, tau):
-    """Step weighted quantile: first value whose cumulative weight >= tau."""
-    ordered = sorted(pairs)
-    total = sum(w for _, w in ordered)
-    if total <= 0.0 or not ordered:
-        return ordered[len(ordered) // 2][0] if ordered else 0.0
-    cum = 0.0
-    for value, w in ordered:
-        cum += w
-        if cum >= tau * total:
-            return value
-    return ordered[-1][0]
+_TIER_RE = re.compile(r"Tier:\s*([a-z\-]+)")
 
 
-def unlock_kind(text):
-    """Classify an unlock description: 'roll', 'sim', or 'unk'."""
+def tier_of(unlock_text):
+    m = _TIER_RE.search(unlock_text or "")
+    return m.group(1) if m else "comparable"
+
+
+def kind_of(text):
     low = (text or "").lower()
     if "simultaneous" in low or "single global" in low:
         return "sim"
@@ -117,197 +78,184 @@ def unlock_kind(text):
     return "unk"
 
 
-def tier_of(text):
-    match = re.search(r"Tier:\s*([a-z\-]+)", text or "")
-    return match.group(1) if match else "comparable"
+def blended_anchor(hour1_viewers, pre_viewers):
+    """Anchor in viewers: alpha on the hour-1 print, the rest on the
+    mean log of the pre-launch hours, when enough of them are known."""
+    hour1 = max(float(hour1_viewers), 1.0)
+    if len(pre_viewers) >= PRE_MIN:
+        mean_log_pre = sum(math.log(v) for v in pre_viewers) / len(pre_viewers)
+        return math.exp(ANCHOR_ALPHA * math.log(hour1)
+                        + (1.0 - ANCHOR_ALPHA) * mean_log_pre)
+    return hour1
 
 
-def hourly_map(rows):
-    """Index hourly rows by their start timestamp; keep positive viewers."""
-    out = {}
-    for row in rows or []:
-        try:
-            when = parse_ts(row["from"])
-            viewers = float(row["viewers"])
-        except (KeyError, TypeError, ValueError):
+def prepare_comparable(comp, target_kind):
+    """Reduce one comparable to its launch-day curve and anchor.
+
+    Returns None when the comparable cannot be used: no hour-1 row, or
+    too few launch-day hours to describe a curve."""
+    day_start = parse_time(comp["day_start"])
+    by_offset = {}
+    for row in comp.get("hourly") or []:
+        viewers = row.get("viewers")
+        if viewers is None or viewers <= 0:
             continue
-        if viewers > 0:
-            out[when] = viewers
+        offset = (parse_time(row["from"]) - day_start).total_seconds() / 3600.0
+        if offset != int(offset):
+            continue
+        by_offset[int(offset)] = float(viewers)
+    day = {o: v for o, v in by_offset.items() if 0 <= o <= 23}
+    if 0 not in day or len(day) < MIN_DAY_HOURS:
+        return None
+    pre = [by_offset[o] for o in range(-PRE_WINDOW, 0) if o in by_offset]
+    anchor = blended_anchor(day[0], pre)
+    weight = TIER_WEIGHT.get(tier_of(comp.get("unlock", "")), 1.0)
+    if target_kind == "roll" and kind_of(comp.get("unlock", "")) == "roll":
+        weight *= ROLL_BOOST
+    return {"anchor_log": math.log(anchor), "day": day, "weight": weight}
+
+
+def target_anchor_log(case):
+    day_start = parse_time(case["day_start"])
+    hour1 = case["known"][0]["viewers"]
+    by_time = {}
+    for row in case.get("history_hourly") or []:
+        if row.get("viewers"):
+            by_time[parse_time(row["from"])] = float(row["viewers"])
+    pre = []
+    for back in range(PRE_WINDOW, 0, -1):
+        v = by_time.get(day_start - timedelta(hours=back))
+        if v is not None and v > 0:
+            pre.append(v)
+    return math.log(blended_anchor(hour1, pre))
+
+
+def weighted_quantile(sorted_pairs, tau):
+    """Step quantile of (value, weight) pairs sorted by value: the
+    first value whose cumulative weight reaches tau of the total."""
+    total = sum(w for _, w in sorted_pairs)
+    if total <= 0:
+        return sorted_pairs[0][0]
+    threshold = tau * total
+    acc = 0.0
+    for value, w in sorted_pairs:
+        acc += w
+        if acc >= threshold:
+            return value
+    return sorted_pairs[-1][0]
+
+
+def hour_pairs(pool, hour):
+    """(log ratio, log anchor, weight) for comparables present at hour."""
+    offset = hour - 1
+    pairs = []
+    for comp in pool:
+        if offset in comp["day"]:
+            ratio = math.log(comp["day"][offset]) - comp["anchor_log"]
+            pairs.append((ratio, comp["anchor_log"], comp["weight"]))
+    return pairs
+
+
+def applied_slope(pairs):
+    """Shrunk, clipped weighted slope of log ratio on log anchor."""
+    total_w = sum(w for _, _, w in pairs)
+    if total_w <= 0:
+        return 0.0
+    x_bar = sum(w * x for _, x, w in pairs) / total_w
+    y_bar = sum(w * v for v, _, w in pairs) / total_w
+    num = sum(w * (x - x_bar) * (v - y_bar) for v, x, w in pairs)
+    den = sum(w * (x - x_bar) ** 2 for _, x, w in pairs)
+    if den <= 0:
+        return 0.0
+    slope = REG_SHRINK * (num / den)
+    return max(SLOPE_LO, min(SLOPE_HI, slope))
+
+
+def hour_log_quantiles(pairs, slope, tgt_anchor_log):
+    """The hour's five log-viewer quantiles for the target."""
+    total_w = sum(w for _, _, w in pairs)
+    x_bar = sum(w * x for _, x, w in pairs) / total_w
+    residuals = sorted((v - slope * (x - x_bar), w) for v, x, w in pairs)
+    median = weighted_quantile(residuals, 0.5)
+    q25 = weighted_quantile(residuals, 0.25)
+    q75 = weighted_quantile(residuals, 0.75)
+    sigma = max((q75 - q25) / 1.349, SIGMA_FLOOR)
+    shift = slope * (tgt_anchor_log - x_bar)
+    out = []
+    for tau, z in zip(LEVELS, Z_OF_LEVEL):
+        empirical = weighted_quantile(residuals, tau)
+        normal = median + z * sigma
+        q = BLEND * empirical + (1.0 - BLEND) * normal
+        q = median + SPREAD * (q - median)
+        out.append(tgt_anchor_log + q + shift)
     return out
 
 
-def pre_launch_log_mean(series, day_start):
-    """Mean log viewers over the 6 hours before release day, or None."""
-    logs = []
-    for back in range(1, PRE_WINDOW_HOURS + 1):
-        when = day_start - timedelta(hours=back)
-        if when in series:
-            logs.append(math.log(series[when]))
-    if len(logs) >= PRE_MIN_POINTS:
-        return sum(logs) / len(logs)
-    return None
+def fallback_log_quantiles(case, hour):
+    """Persistence fallback for an hour with no comparable data: the
+    hour-1 print with a slowly widening log spread."""
+    p = max(float(case["known"][0]["viewers"]), 1.0)
+    width = 0.15 * math.sqrt(hour - 1)
+    return [math.log(p) + z * width for z in Z_OF_LEVEL]
 
 
-def blended_anchor(v1, pre_log):
-    if pre_log is None:
-        return float(v1)
-    return math.exp(ALPHA * math.log(v1) + (1.0 - ALPHA) * pre_log)
-
-
-def comparable_weight(comp, target_kind):
-    w = TIER_WEIGHT.get(comp["tier"], 0.5)
-    if target_kind == "roll" and comp["kind"] == "roll":
-        w *= ROLL_BOOST
-    return w
-
-
-def extract_comparables(case):
-    """Turn the comparables list into usable log-ratio curves."""
-    curves = []
-    for comp in case.get("comparables") or []:
-        name = comp.get("name") or ""
-        if "Grand Theft Auto VI" in name:
-            continue  # the target's own category history is not a launch
-        try:
-            day_start = parse_ts(comp["day_start"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        series = hourly_map(comp.get("hourly"))
-        if day_start not in series:
-            continue
-        v1 = series[day_start]
-        ratios = {}
-        for hour in range(2, 25):
-            when = day_start + timedelta(hours=hour - 1)
-            if when in series:
-                ratios[hour] = math.log(series[when] / v1)
-        if len(ratios) < MIN_VALID_HOURS:
-            continue
-        pre = pre_launch_log_mean(series, day_start)
-        curves.append({
-            "tier": tier_of(comp.get("unlock") or ""),
-            "kind": unlock_kind(comp.get("unlock") or ""),
-            "v1": v1,
-            "anchor": blended_anchor(v1, pre),
-            "ratios": ratios,
-        })
-    return curves
-
-
-def target_pre_log(case, day_start):
-    """Pre-launch log mean for the target, from hourly history if present,
-    else by aggregating minute-level history points into hour buckets."""
-    hourly = case.get("history_hourly") or []
-    series = {}
-    for row in hourly:
-        try:
-            when = parse_ts(row["from"])
-            viewers = float(row["viewers"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if viewers > 0:
-            series[when] = viewers
-    if series:
-        pre = pre_launch_log_mean(series, day_start)
-        if pre is not None:
-            return pre
-    # Fallback: aggregate raw history points (minute reads in the final
-    # case) into per-hour means, then take the 6 hours before day_start.
-    buckets = {}
-    for row in case.get("history") or []:
-        try:
-            when = parse_ts(row["at"])
-            viewers = float(row["viewers"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if viewers > 0:
-            key = when.replace(minute=0, second=0, microsecond=0)
-            buckets.setdefault(key, []).append(viewers)
-    agg = {k: sum(v) / len(v) for k, v in buckets.items()}
-    return pre_launch_log_mean(agg, day_start)
+def clean_quantiles(log_values):
+    """Exponentiate, round, and enforce 0 < q1 <= ... <= q5 <= 1e9."""
+    values = []
+    for lv in log_values:
+        v = round(math.exp(lv), 2)
+        v = min(max(v, 0.01), MAX_VIEWERS)
+        if values and v < values[-1]:
+            v = values[-1]
+        values.append(v)
+    return values
 
 
 def forecast_case(case):
-    levels = case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95]
-    zs = [norm_ppf(t) for t in levels]
-    known = case.get("known") or []
-    p = 1.0
-    if known:
-        try:
-            p = max(1.0, float(known[0]["viewers"]))
-        except (KeyError, TypeError, ValueError):
-            p = 1.0
-    try:
-        day_start = parse_ts(case["day_start"])
-    except (KeyError, TypeError, ValueError):
-        day_start = None
-    pre = target_pre_log(case, day_start) if day_start is not None else None
-    anchor = blended_anchor(p, pre)
-    target_kind = unlock_kind(case.get("notes") or "")
+    target_kind = kind_of(case.get("notes", ""))
+    pool = []
+    for comp in case.get("comparables") or []:
+        prepared = prepare_comparable(comp, target_kind)
+        if prepared is not None:
+            pool.append(prepared)
+    tgt_anchor_log = target_anchor_log(case)
 
-    curves = extract_comparables(case)
-    hours = []
-    for hour in range(2, 25):
-        if not curves:
-            # No usable comparable: persistence baseline shape.
-            qs = [anchor * math.exp(z * 0.15 * math.sqrt(hour - 1))
-                  for z in zs]
+    hours = sorted(fh["hour"] for fh in case.get("forecast") or [])
+    pairs_by_hour = {h: hour_pairs(pool, h) for h in hours}
+
+    # Pass 1: one applied slope per hour, smoothed over its neighbours.
+    raw_slopes = {h: applied_slope(p) for h, p in pairs_by_hour.items() if p}
+    slopes = {}
+    for h in hours:
+        near = [raw_slopes[n] for n in (h - 1, h, h + 1) if n in raw_slopes]
+        slopes[h] = sum(near) / len(near) if near else 0.0
+
+    # Pass 2: quantiles from the residuals of each hour's regression.
+    rows = []
+    for h in hours:
+        pairs = pairs_by_hour[h]
+        if pairs:
+            log_q = hour_log_quantiles(pairs, slopes[h], tgt_anchor_log)
         else:
-            pairs = []
-            for comp in curves:
-                if hour in comp["ratios"]:
-                    w = comparable_weight(comp, target_kind)
-                    # Log-ratio of this hour's viewers to the comparable's
-                    # own blended anchor (same construction as the target).
-                    ratio = comp["ratios"][hour] + math.log(
-                        comp["v1"] / comp["anchor"])
-                    pairs.append((ratio, w))
-            if not pairs:
-                qs = [anchor * math.exp(z * 0.15 * math.sqrt(hour - 1))
-                      for z in zs]
-            else:
-                median = weighted_quantile(pairs, 0.5)
-                q25 = weighted_quantile(pairs, 0.25)
-                q75 = weighted_quantile(pairs, 0.75)
-                sigma = max((q75 - q25) / 1.349, 0.05)
-                qs = []
-                for tau, z in zip(levels, zs):
-                    emp = weighted_quantile(pairs, tau)
-                    norm = median + z * sigma
-                    q = (1.0 - BLEND) * emp + BLEND * norm
-                    q = median + (q - median) * SPREAD
-                    qs.append(anchor * math.exp(q))
-        clean = []
-        prev = 0.0
-        for q in qs:
-            v = q
-            if not math.isfinite(v) or v <= 0.0:
-                v = 1.0
-            v = min(v, 1e9)
-            v = round(v, 2)
-            v = max(v, prev)
-            clean.append(v)
-            prev = v
-        hours.append({"hour": hour, "q": clean})
-    return {"hours": hours}
+            log_q = fallback_log_quantiles(case, h)
+        rows.append({"hour": h, "q": clean_quantiles(log_q)})
+    return {"hours": rows}
 
 
-def main(argv):
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input/"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output/"
+def main():
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
-    for name in names:
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
+    for name in sorted(os.listdir(in_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(in_dir, name), encoding="utf-8") as fh:
             case = json.load(fh)
         result = forecast_case(case)
-        case_id = case.get("id") or name[:-3]
-        out_path = os.path.join(out_dir, case_id + ".out")
+        out_path = os.path.join(out_dir, name[:-3] + ".out")
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(result, separators=(",", ":")))
-            fh.write("\n")
-    return 0
+            json.dump(result, fh, separators=(",", ":"))
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main())
